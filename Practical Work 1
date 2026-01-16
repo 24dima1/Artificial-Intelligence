@@ -1,0 +1,40 @@
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+import matplotlib.pyplot as plt
+
+# 1. Генерация данных
+np.random.seed(42)
+# Создаем 1000 образцов
+X = np.random.uniform(-10, 10, (1000, 2))
+# Цель: 5 - (x1 + x2)
+y = 5 - np.sum(X, axis=1)
+
+# 2. Создание модели
+model = keras.Sequential([
+    keras.layers.Dense(4, activation='relu', input_shape=(2,)),    # скрытый слой с 4 нейронами
+    keras.layers.Dense(1)                                          # выходной слой с 1 нейроном
+])
+
+# 3. Компиляция модели
+model.compile(optimizer='adam', loss='mse')
+
+# 4. Обучение модели
+history = model.fit(X, y, epochs=200, verbose=0)
+
+# 5. Проверка работы
+# Создаем тестовые данные
+X_test = np.array([[2, 3], [-4, 1], [0, 0], [10, -10]])
+y_true = 5 - np.sum(X_test, axis=1)
+y_pred = model.predict(X_test)
+
+# Выводим результаты
+for i in range(len(X_test)):
+    print(f"X: {X_test[i]}, Реальное: {y_true[i]}, Предсказание: {y_pred[i][0]}")
+
+# 6. Визуализация ошибок обучения
+plt.plot(history.history['loss'])
+plt.title('Ошибка потерь в процессе обучения')
+plt.xlabel('Эпохи')
+plt.ylabel('MSE')
+plt.show()
