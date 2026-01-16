@@ -1,0 +1,355 @@
+# Практическая работа №2: Исследование полносвязной нейронной сети для классификации изображений цифр БД MNIST
+# Цель: Создать архитектуру с наименьшим числом нейронов для точности ≥97% на тестовой выборке
+
+# Импорт необходимых библиотек
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers, regularizers
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, classification_report
+
+# Настройка случайных сидов для воспроизводимости
+np.random.seed(42)
+tf.random.set_seed(42)
+
+# 1. ЗАГРУЗКА И ПРЕДОБРАБОТКА ДАННЫХ
+print("=" * 60)
+print("1. ЗАГРУЗКА И ПРЕДОБРАБОТКА ДАННЫХ MNIST")
+print("=" * 60)
+
+# Загрузка данных MNIST
+(x_train_full, y_train_full), (x_test, y_test) = keras.datasets.mnist.load_data()
+
+print(f"Размер обучающей выборки: {x_train_full.shape}")
+print(f"Размер тестовой выборки: {x_test.shape}")
+print(f"Диапазон значений пикселей: [{x_train_full.min()}, {x_train_full.max()}]")
+
+# Визуализация нескольких примеров
+fig, axes = plt.subplots(2, 5, figsize=(10, 4))
+for i, ax in enumerate(axes.flat):
+    ax.imshow(x_train_full[i], cmap='gray')
+    ax.set_title(f"Цифра: {y_train_full[i]}")
+    ax.axis('off')
+plt.suptitle("Примеры изображений из MNIST", fontsize=14)
+plt.tight_layout()
+plt.show()
+
+# Предобработка данных
+# Нормализация пикселей в диапазон [0, 1]
+x_train_full = x_train_full.astype("float32") / 255.0
+x_test = x_test.astype("float32") / 255.0
+
+# Выравнивание изображений (28x28 -> 784)
+x_train_full = x_train_full.reshape(-1, 28 * 28)
+x_test = x_test.reshape(-1, 28 * 28)
+
+# Преобразование меток в one-hot encoding
+y_train_full = keras.utils.to_categorical(y_train_full, 10)
+y_test_categorical = keras.utils.to_categorical(y_test, 10)
+
+# Разделение на обучающую и валидационную выборки
+validation_split_ratio = 0.1  # 10% для валидации
+split_index = int(len(x_train_full) * (1 - validation_split_ratio))
+
+x_train = x_train_full[:split_index]
+y_train = y_train_full[:split_index]
+x_val = x_train_full[split_index:]
+y_val = y_train_full[split_index:]
+
+print(f"\nРазделение данных:")
+print(f"  Обучающая выборка: {x_train.shape[0]} примеров")
+print(f"  Валидационная выборка: {x_val.shape[0]} примеров")
+print(f"  Тестовая выборка: {x_test.shape[0]} примеров")
+
+# 2. СОЗДАНИЕ АРХИТЕКТУРЫ НЕЙРОННОЙ СЕТИ
+print("\n" + "=" * 60)
+print("2. СОЗДАНИЕ АРХИТЕКТУРЫ НЕЙРОННОЙ СЕТИ")
+print("=" * 60)
+
+def create_model(hidden_units=[256, 128], dropout_rate=0.3, use_reg=False):
+    """
+    Создает полносвязную нейронную сеть
+    
+    Параметры:
+    hidden_units: список с количеством нейронов в скрытых слоях
+    dropout_rate: вероятность отключения нейронов (для борьбы с переобучением)
+    use_reg: использовать ли L2 регуляризацию
+    """
+    model = keras.Sequential()
+    
+    # Входной слой
+    model.add(layers.Input(shape=(784,)))
+    
+    # Добавление скрытых слоев
+    for i, units in enumerate(hidden_units):
+        if use_reg:
+            model.add(layers.Dense(
+                units,
+                activation='relu',
+                kernel_regularizer=regularizers.l2(0.001) if use_reg else None,
+                kernel_initializer='he_normal',
+                name=f'hidden_layer_{i+1}'
+            ))
+        else:
+            model.add(layers.Dense(
+                units,
+                activation='relu',
+                kernel_initializer='he_normal',
+                name=f'hidden_layer_{i+1}'
+            ))
+        
+        # Добавление BatchNormalization для ускорения обучения
+        model.add(layers.BatchNormalization())
+        
+        # Добавление Dropout для борьбы с переобучением
+        model.add(layers.Dropout(dropout_rate))
+    
+    # Выходной слой
+    model.add(layers.Dense(10, activation='softmax', name='output_layer'))
+    
+    return model
+
+# Создаем модель с минимальной архитектурой
+print("Создание модели с архитектурой: 784-256-128-10")
+model = create_model(hidden_units=[256, 128], dropout_rate=0.3, use_reg=True)
+
+# Выводим информацию о модели
+model.summary()
+
+# 3. КОМПИЛЯЦИЯ МОДЕЛИ
+print("\n" + "=" * 60)
+print("3. КОМПИЛЯЦИЯ МОДЕЛИ")
+print("=" * 60)
+
+# Компиляция модели
+model.compile(
+    optimizer=keras.optimizers.Adam(learning_rate=0.001),
+    loss='categorical_crossentropy',
+    metrics=['accuracy']
+)
+
+print("Модель скомпилирована с параметрами:")
+print(f"  Оптимизатор: Adam (learning_rate=0.001)")
+print(f"  Функция потерь: categorical_crossentropy")
+print(f"  Метрика: accuracy")
+
+# 4. ОБУЧЕНИЕ МОДЕЛИ С КОНТРОЛЕМ ПЕРЕОБУЧЕНИЯ
+print("\n" + "=" * 60)
+print("4. ОБУЧЕНИЕ МОДЕЛИ С ИСПОЛЬЗОВАНИЕМ ВАЛИДАЦИОННОЙ ВЫБОРКИ")
+print("=" * 60)
+
+# Callbacks для контроля обучения
+callbacks = [
+    # Ранняя остановка при переобучении
+    keras.callbacks.EarlyStopping(
+        monitor='val_accuracy',
+        patience=10,
+        restore_best_weights=True,
+        verbose=1
+    ),
+    # Сохранение лучшей модели
+    keras.callbacks.ModelCheckpoint(
+        'best_model_mnist.keras',
+        monitor='val_accuracy',
+        save_best_only=True,
+        verbose=0
+    ),
+    # Уменьшение скорости обучения при застое
+    keras.callbacks.ReduceLROnPlateau(
+        monitor='val_loss',
+        factor=0.5,
+        patience=5,
+        min_lr=0.00001,
+        verbose=1
+    )
+]
+
+# Обучение модели
+history = model.fit(
+    x_train, y_train,
+    epochs=50,
+    batch_size=128,
+    validation_data=(x_val, y_val),
+    callbacks=callbacks,
+    verbose=1
+)
+
+# 5. ВИЗУАЛИЗАЦИЯ ПРОЦЕССА ОБУЧЕНИЯ
+print("\n" + "=" * 60)
+print("5. ВИЗУАЛИЗАЦИЯ ПРОЦЕССА ОБУЧЕНИЯ")
+print("=" * 60)
+
+# Создаем графики обучения
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# График точности
+axes[0].plot(history.history['accuracy'], label='Обучающая точность', linewidth=2)
+axes[0].plot(history.history['val_accuracy'], label='Валидационная точность', linewidth=2)
+axes[0].axhline(y=0.97, color='r', linestyle='--', alpha=0.5, label='Целевая точность (97%)')
+axes[0].set_xlabel('Эпоха')
+axes[0].set_ylabel('Точность')
+axes[0].set_title('Точность модели во время обучения')
+axes[0].legend()
+axes[0].grid(True, alpha=0.3)
+
+# График функции потерь
+axes[1].plot(history.history['loss'], label='Обучающие потери', linewidth=2)
+axes[1].plot(history.history['val_loss'], label='Валидационные потери', linewidth=2)
+axes[1].set_xlabel('Эпоха')
+axes[1].set_ylabel('Потери')
+axes[1].set_title('Функция потерь во время обучения')
+axes[1].legend()
+axes[1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+# 6. ОЦЕНКА МОДЕЛИ НА ТЕСТОВОЙ ВЫБОРКЕ
+print("\n" + "=" * 60)
+print("6. ОЦЕНКА МОДЕЛИ НА ТЕСТОВОЙ ВЫБОРКЕ")
+print("=" * 60)
+
+# Загрузка лучшей модели
+best_model = keras.models.load_model('best_model_mnist.keras')
+
+# Оценка на тестовых данных
+test_loss, test_accuracy = best_model.evaluate(x_test, y_test_categorical, verbose=0)
+
+print(f"Точность на тестовой выборке: {test_accuracy:.4f} ({test_accuracy*100:.2f}%)")
+print(f"Потери на тестовой выборке: {test_loss:.4f}")
+
+# Проверка достижения цели
+if test_accuracy >= 0.97:
+    print("\n✅ ЦЕЛЬ ДОСТИГНУТА! Точность ≥97%")
+else:
+    print("\n⚠️ Цель не достигнута. Попробуйте изменить параметры модели.")
+
+# 7. АНАЛИЗ РЕЗУЛЬТАТОВ КЛАССИФИКАЦИИ
+print("\n" + "=" * 60)
+print("7. АНАЛИЗ РЕЗУЛЬТАТОВ КЛАССИФИКАЦИИ")
+print("=" * 60)
+
+# Предсказания на тестовой выборке
+y_pred_proba = best_model.predict(x_test, verbose=0)
+y_pred = np.argmax(y_pred_proba, axis=1)
+
+# Матрица ошибок
+cm = confusion_matrix(y_test, y_pred)
+
+# Визуализация матрицы ошибок
+plt.figure(figsize=(10, 8))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+            xticklabels=range(10), yticklabels=range(10))
+plt.title('Матрица ошибок классификации', fontsize=14)
+plt.xlabel('Предсказанные метки')
+plt.ylabel('Истинные метки')
+plt.tight_layout()
+plt.show()
+
+# Отчет по классификации
+print("\nОтчет по классификации:")
+print(classification_report(y_test, y_pred, target_names=[str(i) for i in range(10)]))
+
+# 8. ВИЗУАЛИЗАЦИЯ ОШИБОК КЛАССИФИКАЦИИ
+print("\n" + "=" * 60)
+print("8. ВИЗУАЛИЗАЦИЯ ОШИБОК КЛАССИФИКАЦИИ")
+print("=" * 60)
+
+# Находим примеры с ошибками классификации
+errors_idx = np.where(y_pred != y_test)[0]
+
+if len(errors_idx) > 0:
+    print(f"Найдено {len(errors_idx)} ошибок классификации")
+    
+    # Показываем первые 10 ошибок
+    fig, axes = plt.subplots(2, 5, figsize=(15, 6))
+    for i, ax in enumerate(axes.flat[:min(10, len(errors_idx))]):
+        idx = errors_idx[i]
+        ax.imshow(x_test[idx].reshape(28, 28), cmap='gray')
+        ax.set_title(f"Истинная: {y_test[idx]}\nПредсказана: {y_pred[idx]}", 
+                    color='red' if y_test[idx] != y_pred[idx] else 'green')
+        ax.axis('off')
+    plt.suptitle('Примеры ошибок классификации', fontsize=14)
+    plt.tight_layout()
+    plt.show()
+else:
+    print("Ошибок классификации не найдено!")
+
+# 9. АНАЛИЗ ЭФФЕКТИВНОСТИ МОДЕЛИ
+print("\n" + "=" * 60)
+print("9. АНАЛИЗ ЭФФЕКТИВНОСТИ МОДЕЛИ")
+print("=" * 60)
+
+# Подсчет параметров модели
+total_params = model.count_params()
+trainable_params = np.sum([np.prod(v.shape) for v in model.trainable_weights])
+
+print(f"Общее количество параметров модели: {total_params:,}")
+print(f"Количество обучаемых параметров: {trainable_params:,}")
+
+# Вычисление точности по классам
+class_accuracy = []
+for i in range(10):
+    idx = y_test == i
+    if np.sum(idx) > 0:
+        acc = np.mean(y_pred[idx] == y_test[idx])
+        class_accuracy.append(acc)
+        print(f"Точность для цифры {i}: {acc:.2%}")
+
+print(f"\nМинимальная точность по классам: {min(class_accuracy):.2%}")
+print(f"Максимальная точность по классам: {max(class_accuracy):.2%}")
+
+# 10. ЭКСПЕРИМЕНТЫ С УПРОЩЕНИЕМ АРХИТЕКТУРЫ
+print("\n" + "=" * 60)
+print("10. ЭКСПЕРИМЕНТЫ С УПРОЩЕНИЕМ АРХИТЕКТУРЫ")
+print("=" * 60)
+
+# Попробуем более простую архитектуру
+simple_architectures = [
+    [128, 64],   # Более простая
+    [128],       # Еще проще
+    [64, 32],    # Минимальная
+]
+
+print("Тестирование более простых архитектур...")
+print("-" * 40)
+
+for i, arch in enumerate(simple_architectures):
+    print(f"\nАрхитектура {i+1}: 784-{'-'.join(map(str, arch))}-10")
+    
+    # Создаем и обучаем упрощенную модель
+    simple_model = create_model(hidden_units=arch, dropout_rate=0.2, use_reg=True)
+    simple_model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=0.001),
+        loss='categorical_crossentropy',
+        metrics=['accuracy']
+    )
+    
+    # Быстрое обучение (меньше эпох)
+    simple_history = simple_model.fit(
+        x_train, y_train,
+        epochs=20,
+        batch_size=128,
+        validation_data=(x_val, y_val),
+        verbose=0
+    )
+    
+    # Оценка на тесте
+    simple_test_loss, simple_test_accuracy = simple_model.evaluate(
+        x_test, y_test_categorical, verbose=0
+    )
+    
+    print(f"  Тестовая точность: {simple_test_accuracy:.4f} ({simple_test_accuracy*100:.2f}%)")
+    
+    if simple_test_accuracy >= 0.97:
+        print(f"  ✅ Достигает цели с {sum(arch)} нейронами в скрытых слоях")
+        break
+    else:
+        print(f"  ⚠️ Не достигает цели")
+
+print("\n" + "=" * 60)
+print("ВЫВОДЫ И РЕКОМЕНДАЦИИ")
+print("=" * 60)
+
