@@ -1,0 +1,456 @@
+"""
+Программа для предсказания положения объектов в видеопотоке с использованием RNN
+Вариант 8
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+import cv2
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+import os
+from tqdm import tqdm
+
+# Установка seed для воспроизводимости
+torch.manual_seed(42)
+np.random.seed(42)
+
+# ============================================
+# 1. Генерация синтетического датасета (Moving MNIST)
+# ============================================
+
+class MovingMNIST(Dataset):
+    """
+    Упрощенная версия Moving MNIST для демонстрации
+    Генерирует последовательности кадров с движущимися объектами
+    """
+    def __init__(self, num_sequences=1000, seq_length=20, img_size=64, num_objects=2):
+        self.num_sequences = num_sequences
+        self.seq_length = seq_length
+        self.img_size = img_size
+        self.num_objects = num_objects
+        
+    def __len__(self):
+        return self.num_sequences
+    
+    def __getitem__(self, idx):
+        """
+        Генерирует одну последовательность:
+        - Возвращает тензор размера (seq_length, 1, img_size, img_size)
+        - Каждый кадр содержит движущиеся объекты (квадраты/круги)
+        """
+        frames = []
+        object_positions = []  # Для хранения истинных положений объектов
+        
+        # Инициализация объектов
+        objects = []
+        for _ in range(self.num_objects):
+            obj = {
+                'x': np.random.randint(10, self.img_size-10),
+                'y': np.random.randint(10, self.img_size-10),
+                'vx': np.random.randint(-2, 3),
+                'vy': np.random.randint(-2, 3),
+                'size': np.random.randint(3, 8)
+            }
+            objects.append(obj)
+        
+        for t in range(self.seq_length):
+            frame = np.zeros((1, self.img_size, self.img_size), dtype=np.float32)
+            positions = []
+            
+            for i, obj in enumerate(objects):
+                # Обновление позиции
+                obj['x'] += obj['vx']
+                obj['y'] += obj['vy']
+                
+                # Отражение от границ
+                if obj['x'] <= obj['size'] or obj['x'] >= self.img_size - obj['size']:
+                    obj['vx'] *= -1
+                if obj['y'] <= obj['size'] or obj['y'] >= self.img_size - obj['size']:
+                    obj['vy'] *= -1
+                
+                # Отрисовка объекта (круг)
+                y, x = np.ogrid[:self.img_size, :self.img_size]
+                mask = (x - obj['x'])**2 + (y - obj['y'])**2 <= obj['size']**2
+                frame[0, mask] = 1.0
+                
+                positions.append([obj['x'] / self.img_size, obj['y'] / self.img_size])  # Нормализация
+            
+            frames.append(frame.copy())
+            object_positions.append(positions)
+        
+        return torch.FloatTensor(frames), torch.FloatTensor(object_positions)
+
+# ============================================
+# 2. Архитектура модели RNN для предсказания положений
+# ============================================
+
+class PositionPredictorRNN(nn.Module):
+    """
+    RNN модель для предсказания положения объектов в видеопотоке
+    Архитектура: Сверточный энкодер + LSTM + Полносвязный декодер
+    """
+    def __init__(self, input_channels=1, hidden_size=256, num_layers=2, num_objects=2):
+        super(PositionPredictorRNN, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.num_objects = num_objects
+        
+        # Сверточный энкодер для извлечения признаков из кадров
+        self.encoder = nn.Sequential(
+            nn.Conv2d(input_channels, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((4, 4)),
+            nn.Flatten(),
+            nn.Linear(128 * 4 * 4, hidden_size)
+        )
+        
+        # LSTM для моделирования временных зависимостей
+        self.lstm = nn.LSTM(
+            input_size=hidden_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=0.3 if num_layers > 1 else 0
+        )
+        
+        # Декодер для предсказания координат всех объектов
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_size, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, num_objects * 2),  # x, y для каждого объекта
+            nn.Sigmoid()  # Нормализация координат в [0, 1]
+        )
+    
+    def forward(self, x, hidden=None):
+        """
+        x: тензор формы (batch_size, seq_len, channels, height, width)
+        Возвращает: предсказанные координаты (batch_size, seq_len, num_objects * 2)
+        """
+        batch_size, seq_len = x.size(0), x.size(1)
+        
+        # Энкодинг каждого кадра
+        encoded = []
+        for t in range(seq_len):
+            frame = x[:, t, :, :, :]  # (batch, channels, h, w)
+            features = self.encoder(frame)
+            encoded.append(features)
+        
+        encoded = torch.stack(encoded, dim=1)  # (batch, seq_len, hidden_size)
+        
+        # LSTM моделирование временных зависимостей
+        lstm_out, hidden = self.lstm(encoded, hidden)
+        
+        # Декодинг в координаты
+        positions = self.decoder(lstm_out)  # (batch, seq_len, num_objects*2)
+        
+        return positions, hidden
+
+# ============================================
+# 3. Обучение модели
+# ============================================
+
+def train_model(model, train_loader, val_loader, num_epochs=20, device='cuda'):
+    """
+    Обучение модели предсказания положений
+    """
+    model = model.to(device)
+    criterion = nn.MSELoss()  # Функция потерь для регрессии координат
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3)
+    
+    train_losses = []
+    val_losses = []
+    
+    for epoch in range(num_epochs):
+        # Обучение
+        model.train()
+        train_loss = 0.0
+        train_batches = 0
+        
+        for batch_idx, (frames, true_positions) in enumerate(tqdm(train_loader, desc=f'Epoch {epoch+1} Train')):
+            frames = frames.to(device)
+            true_positions = true_positions.to(device)
+            
+            # Для обучения используем teacher forcing: подаем все кадры сразу
+            predicted_positions, _ = model(frames)
+            
+            # Вычисление потерь
+            loss = criterion(predicted_positions, true_positions.view(true_positions.size(0), 
+                                                                      true_positions.size(1), -1))
+            
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Предотвращение взрыва градиентов
+            optimizer.step()
+            
+            train_loss += loss.item()
+            train_batches += 1
+        
+        avg_train_loss = train_loss / train_batches
+        train_losses.append(avg_train_loss)
+        
+        # Валидация
+        model.eval()
+        val_loss = 0.0
+        val_batches = 0
+        
+        with torch.no_grad():
+            for frames, true_positions in val_loader:
+                frames = frames.to(device)
+                true_positions = true_positions.to(device)
+                
+                predicted_positions, _ = model(frames)
+                loss = criterion(predicted_positions, true_positions.view(true_positions.size(0), 
+                                                                          true_positions.size(1), -1))
+                
+                val_loss += loss.item()
+                val_batches += 1
+        
+        avg_val_loss = val_loss / val_batches
+        val_losses.append(avg_val_loss)
+        
+        scheduler.step(avg_val_loss)
+        
+        print(f'Epoch {epoch+1}/{num_epochs}: Train Loss = {avg_train_loss:.6f}, Val Loss = {avg_val_loss:.6f}')
+    
+    return train_losses, val_losses
+
+# ============================================
+# 4. Проверка работоспособности
+# ============================================
+
+def predict_next_positions(model, video_sequence, num_predict=5):
+    """
+    Предсказание следующих положений объектов на основе видеопоследовательности
+    
+    Args:
+        model: обученная модель
+        video_sequence: тензор (seq_len, channels, height, width)
+        num_predict: количество кадров для предсказания вперед
+    
+    Returns:
+        predicted_positions: предсказанные координаты для будущих кадров
+    """
+    model.eval()
+    
+    with torch.no_grad():
+        # Добавляем batch dimension
+        video_sequence = video_sequence.unsqueeze(0)  # (1, seq_len, channels, h, w)
+        
+        # Получаем предсказания для всей последовательности
+        all_predictions, hidden = model(video_sequence)
+        
+        # Предсказание следующих кадров
+        current_frame = video_sequence[:, -1:, :, :, :]
+        future_predictions = []
+        
+        for _ in range(num_predict):
+            # Энкодинг текущего кадра
+            encoded = model.encoder(current_frame.squeeze(1))
+            encoded = encoded.unsqueeze(1)  # (1, 1, hidden_size)
+            
+            # LSTM шаг
+            lstm_out, hidden = model.lstm(encoded, hidden)
+            
+            # Декодинг позиций
+            positions = model.decoder(lstm_out)
+            future_predictions.append(positions)
+            
+            # Для следующего шага используем предсказанную позицию (но в реальности нужен полный кадр)
+            # Здесь упрощение: генерируем новый кадр с объектами в предсказанных позициях
+            # В реальном приложении здесь был бы модуль генерации кадров
+            
+            # Для демо просто создаем заглушку кадра
+            dummy_frame = torch.zeros_like(current_frame)
+            current_frame = dummy_frame
+        
+        future_predictions = torch.cat(future_predictions, dim=1)
+    
+    return all_predictions, future_predictions
+
+def visualize_predictions(frames, true_positions, predicted_positions, future_predictions=None, num_objects=2):
+    """
+    Визуализация предсказаний модели
+    """
+    seq_len = frames.size(0)
+    
+    fig, axes = plt.subplots(2, min(5, seq_len), figsize=(15, 6))
+    if axes.ndim == 1:
+        axes = axes.reshape(1, -1)
+    
+    colors = ['red', 'blue', 'green', 'orange']
+    
+    for t in range(min(5, seq_len)):
+        # Истинный кадр
+        ax = axes[0, t]
+        ax.imshow(frames[t, 0].numpy(), cmap='gray')
+        ax.set_title(f'Frame {t+1} (True)')
+        ax.axis('off')
+        
+        # Отмечаем истинные позиции
+        for obj_idx in range(num_objects):
+            x, y = true_positions[t, obj_idx].numpy()
+            x *= frames.size(2)  # Денормализация
+            y *= frames.size(3)
+            rect = Rectangle((x-5, y-5), 10, 10, linewidth=2, edgecolor=colors[obj_idx], facecolor='none')
+            ax.add_patch(rect)
+        
+        # Предсказанные позиции
+        ax = axes[1, t]
+        ax.imshow(frames[t, 0].numpy(), cmap='gray')
+        ax.set_title(f'Frame {t+1} (Predicted)')
+        ax.axis('off')
+        
+        for obj_idx in range(num_objects):
+            x_pred, y_pred = predicted_positions[t, obj_idx*2:(obj_idx+1)*2].detach().numpy()
+            x_pred *= frames.size(2)
+            y_pred *= frames.size(3)
+            circle = plt.Circle((x_pred, y_pred), 5, color=colors[obj_idx], fill=False, linewidth=2)
+            ax.add_patch(circle)
+    
+    plt.tight_layout()
+    plt.savefig('prediction_results.png', dpi=150)
+    plt.show()
+    
+    # Если есть предсказания будущих кадров
+    if future_predictions is not None:
+        fig, axes = plt.subplots(1, future_predictions.size(1), figsize=(15, 3))
+        if axes.ndim == 0:
+            axes = [axes]
+        
+        for t in range(future_predictions.size(1)):
+            ax = axes[t]
+            # Создаем пустой кадр (в реальности был бы сгенерированный)
+            empty_frame = np.zeros((frames.size(2), frames.size(3)))
+            ax.imshow(empty_frame, cmap='gray')
+            ax.set_title(f'Future {t+1}')
+            ax.axis('off')
+            
+            for obj_idx in range(num_objects):
+                x_pred, y_pred = future_predictions[0, t, obj_idx*2:(obj_idx+1)*2].detach().numpy()
+                x_pred *= frames.size(2)
+                y_pred *= frames.size(3)
+                circle = plt.Circle((x_pred, y_pred), 5, color=colors[obj_idx], fill=True)
+                ax.add_patch(circle)
+        
+        plt.tight_layout()
+        plt.savefig('future_predictions.png', dpi=150)
+        plt.show()
+
+# ============================================
+# 5. Основной цикл выполнения
+# ============================================
+
+def main():
+    print("=" * 50)
+    print("Программа предсказания положения объектов в видеопотоке")
+    print("Вариант 8")
+    print("=" * 50)
+    
+    # Параметры
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Используется устройство: {device}")
+    
+    batch_size = 32
+    seq_length = 15
+    img_size = 64
+    num_objects = 2
+    
+    # Создание датасетов
+    print("\n1. Создание датасета Moving MNIST...")
+    train_dataset = MovingMNIST(num_sequences=1000, seq_length=seq_length, 
+                                 img_size=img_size, num_objects=num_objects)
+    val_dataset = MovingMNIST(num_sequences=200, seq_length=seq_length, 
+                               img_size=img_size, num_objects=num_objects)
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    
+    print(f"   Обучающих последовательностей: {len(train_dataset)}")
+    print(f"   Валидационных последовательностей: {len(val_dataset)}")
+    
+    # Создание модели
+    print("\n2. Инициализация модели RNN...")
+    model = PositionPredictorRNN(
+        input_channels=1,
+        hidden_size=256,
+        num_layers=2,
+        num_objects=num_objects
+    )
+    print(f"   Параметров модели: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # Обучение
+    print("\n3. Начало обучения...")
+    train_losses, val_losses = train_model(
+        model, train_loader, val_loader, 
+        num_epochs=15, device=device
+    )
+    
+    # График обучения
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_losses, label='Train Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('MSE Loss')
+    plt.title('Процесс обучения модели')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('training_history.png', dpi=150)
+    plt.show()
+    
+    # Проверка на тестовом примере
+    print("\n4. Проверка работоспособности на тестовом примере...")
+    test_sequence, test_positions = val_dataset[0]
+    
+    # Предсказание для всей последовательности
+    predictions, future_preds = predict_next_positions(
+        model.to(device), 
+        test_sequence.to(device),
+        num_predict=5
+    )
+    
+    # Визуализация
+    visualize_predictions(
+        test_sequence.cpu(),
+        test_positions.cpu(),
+        predictions[0].cpu(),  # убираем batch dimension
+        future_preds.cpu(),
+        num_objects=num_objects
+    )
+    
+    # Оценка точности
+    print("\n5. Оценка точности предсказаний:")
+    mse = torch.mean((predictions[0].cpu() - test_positions.view(seq_length, -1))**2).item()
+    print(f"   Среднеквадратичная ошибка (MSE): {mse:.6f}")
+    
+    # Расчет точности в пикселях
+    mse_pixels = mse * (img_size ** 2)
+    print(f"   Средняя ошибка в пикселях: {np.sqrt(mse_pixels):.2f} px")
+    
+    print("\n" + "=" * 50)
+    print("Работа программы завершена успешно!")
+    print("Результаты сохранены в файлах:")
+    print("  - training_history.png (график обучения)")
+    print("  - prediction_results.png (предсказания на тестовых кадрах)")
+    print("  - future_predictions.png (предсказания будущих положений)")
+    print("=" * 50)
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
